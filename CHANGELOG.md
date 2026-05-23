@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.31.0
+
+- Added Google Meet-only raw caption snapshots so saved/copied transcripts are recomputed from captured caption history instead of the live panel draft.
+- Kept Microsoft Teams on the existing capture/export path.
+
+## 0.30.1
+
+- Fixed panel dragging on Google Meet preview pages so camera on/off no longer changes how far up the transcript panel can move.
+
 ## 0.30.0
 
 - Removed old Stop/Resume state and related unused code.

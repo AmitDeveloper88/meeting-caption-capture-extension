@@ -1,8 +1,9 @@
 (() => {
   const HOST_ID = "meeting-caption-capture-root";
-  const VERSION = "0.30.0";
+  const VERSION = "0.31.0";
   const SELF_NAME = "Amit Kumar";
   const STORAGE_KEY = `meeting-caption-capture:${VERSION}:${location.host}:${location.pathname}`;
+  const RAW_STORAGE_KEY = `meeting-caption-capture-raw:${VERSION}:${location.host}:${location.pathname}`;
   const POSITION_KEY = `meeting-caption-capture-position:${location.host}`;
   const IS_TEAMS = location.hostname.includes("teams.microsoft.com");
   const IS_MEET = location.hostname.includes("meet.google.com");
@@ -11,6 +12,8 @@
   const CAPTION_STALE_MS = 8000;
   const ROLLING_WINDOW_MS = 30000;
   const RECENT_KEY_LIMIT = 60;
+  const MEET_RAW_SNAPSHOT_LIMIT = 3000;
+  const MEET_CONTINUATION_GAP_MS = 12000;
   const TEAMS_SELECTORS = {
     CAPTIONS_RENDERER:
       "[data-tid='closed-caption-v2-window-wrapper'], [data-tid='closed-captions-renderer'], [data-tid*='closed-caption'], [data-tid*='caption-container'], [aria-live='polite'], [aria-live='assertive']",
@@ -27,6 +30,8 @@
   let scanTimer = null;
   let lastCaptionAt = 0;
   const entries = safeJson(localStorage.getItem(STORAGE_KEY), []);
+  let rawSnapshots = IS_MEET ? safeJson(localStorage.getItem(RAW_STORAGE_KEY), []) : [];
+  let lastRawSnapshotKey = "";
   const recentKeys = [];
   const lastIndexBySpeaker = new Map();
   const lastSeenAtBySpeaker = new Map();
@@ -34,6 +39,8 @@
   entries.forEach((entry, index) => {
     if (entry?.speaker) lastIndexBySpeaker.set(speakerKey(entry.speaker), index);
   });
+  rawSnapshots = normalizeStoredRawSnapshots(rawSnapshots);
+  lastRawSnapshotKey = rawSnapshots.length ? rawSnapshotKey(rawSnapshots[rawSnapshots.length - 1]) : "";
 
   const host = document.createElement("div");
   host.id = HOST_ID;
@@ -300,10 +307,13 @@
 
   shadow.getElementById("clear").addEventListener("click", () => {
     entries.length = 0;
+    rawSnapshots.length = 0;
+    lastRawSnapshotKey = "";
     recentKeys.length = 0;
     lastIndexBySpeaker.clear();
     lastSeenAtBySpeaker.clear();
     finalized = false;
+    if (IS_MEET) localStorage.removeItem(RAW_STORAGE_KEY);
     saveAndRender();
     updateMeetingState();
   });
@@ -522,36 +532,7 @@
   }
 
   function panelTopMin() {
-    return clamp(findMeetingSurfaceTop() + 8, 8, window.innerHeight - 44);
-  }
-
-  function findMeetingSurfaceTop() {
-    const selectors = [
-      "video",
-      "[data-self-name]",
-      "[data-requested-participant-id]",
-      "[data-tid*='stage']",
-      "[data-tid*='participant']",
-      "[role='main'] div",
-    ].join(",");
-
-    const candidates = Array.from(document.querySelectorAll(selectors))
-      .map((element) => element.getBoundingClientRect())
-      .filter((rect) => {
-        const area = rect.width * rect.height;
-        return (
-          area > window.innerWidth * window.innerHeight * 0.08 &&
-          rect.width > window.innerWidth * 0.22 &&
-          rect.height > window.innerHeight * 0.14 &&
-          rect.top > 36 &&
-          rect.top < window.innerHeight * 0.62 &&
-          rect.left > -4 &&
-          rect.right < window.innerWidth + 4
-        );
-      })
-      .sort((a, b) => b.width * b.height - a.width * a.height);
-
-    return candidates[0]?.top || 72;
+    return clamp(8, 8, window.innerHeight - 44);
   }
 
   function captureFromTeamsCaptionRoot() {
@@ -805,8 +786,10 @@
 
   function commit(entry) {
     const speaker = normalizeSpeaker(entry.speaker);
-    const text = cleanCaption(entry.text);
+    const rawText = cleanRawCaptionText(entry.text);
+    const text = cleanCaption(rawText);
     if (!isSpeakerLine(speaker, text) || !isCaptionText(text)) return;
+    recordRawCaption({ speaker, text: rawText });
 
     const now = Date.now();
     const keySpeaker = speakerKey(speaker);
@@ -843,6 +826,63 @@
     lastSeenAtBySpeaker.set(keySpeaker, now);
     remember(key);
     saveAndRender();
+  }
+
+  function recordRawCaption(entry) {
+    if (!IS_MEET) return;
+
+    const speaker = normalizeSpeaker(entry.speaker);
+    const text = cleanRawCaptionText(entry.text);
+    if (!isSpeakerLine(speaker, text) || !isCaptionText(text)) return;
+
+    const snapshot = { speaker, text, seenAt: Date.now() };
+    const key = rawSnapshotKey(snapshot);
+    if (!key || key === lastRawSnapshotKey) return;
+
+    rawSnapshots.push(snapshot);
+    lastRawSnapshotKey = key;
+
+    if (rawSnapshots.length > MEET_RAW_SNAPSHOT_LIMIT) {
+      rawSnapshots.splice(0, rawSnapshots.length - MEET_RAW_SNAPSHOT_LIMIT);
+    }
+
+    saveRawSnapshots();
+  }
+
+  function normalizeStoredRawSnapshots(value) {
+    if (!IS_MEET || !Array.isArray(value)) return [];
+
+    const normalized = [];
+    let previousKey = "";
+
+    for (const item of value) {
+      const speaker = normalizeSpeaker(item?.speaker);
+      const text = cleanRawCaptionText(item?.text);
+      const seenAt = Number(item?.seenAt || item?.updatedAt || 0) || Date.now();
+      const snapshot = { speaker, text, seenAt };
+      const key = rawSnapshotKey(snapshot);
+
+      if (!key || key === previousKey) continue;
+      if (!isSpeakerLine(speaker, text) || !isCaptionText(text)) continue;
+
+      normalized.push(snapshot);
+      previousKey = key;
+    }
+
+    return normalized.slice(-MEET_RAW_SNAPSHOT_LIMIT);
+  }
+
+  function rawSnapshotKey(snapshot) {
+    const speaker = speakerKey(snapshot?.speaker || "");
+    const text = normalizeForCompare(snapshot?.text || "");
+    return speaker && text ? `${speaker}: ${text}` : "";
+  }
+
+  function saveRawSnapshots() {
+    if (!IS_MEET) return;
+    try {
+      localStorage.setItem(RAW_STORAGE_KEY, JSON.stringify(rawSnapshots));
+    } catch {}
   }
 
   function getCaptionsState() {
@@ -1049,6 +1089,14 @@
     return value.split(/\s+/).length >= 2;
   }
 
+  function isTranscriptEntryText(text) {
+    const value = cleanText(text);
+    if (value.length < 3) return false;
+    if (!/[A-Za-z]/.test(value)) return false;
+    if (looksLikeNameOnly(value)) return false;
+    return value.split(/\s+/).length >= 2;
+  }
+
   function looksLikeNameOnly(value) {
     return /^[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2}$/.test(cleanText(value));
   }
@@ -1083,13 +1131,15 @@
     return cleanText(element.innerText || element.textContent || "");
   }
 
-  function cleanCaption(value) {
-    return cleanTranscriptText(
-      cleanText(value)
+  function cleanRawCaptionText(value) {
+    return cleanText(value)
       .replace(/\b(CC|Captions|Live captions|Turn on captions|Turn off captions)\b/gi, "")
       .replace(/\s+([,.!?;:])/g, "$1")
-      .trim()
-    );
+      .trim();
+  }
+
+  function cleanCaption(value) {
+    return cleanTranscriptText(cleanRawCaptionText(value));
   }
 
   function normalizeSpeaker(value) {
@@ -1223,6 +1273,124 @@
     return cleanTranscriptText(shouldReplaceRollingText(previous, next) ? next : previous);
   }
 
+  function compileMeetRawSnapshots(snapshots) {
+    if (!IS_MEET) return [];
+
+    const compiled = [];
+    for (const snapshot of normalizeStoredRawSnapshots(snapshots)) {
+      const speaker = normalizeSpeaker(snapshot.speaker);
+      const text = cleanCaption(snapshot.text);
+      if (!isSpeakerLine(speaker, text) || !isCaptionText(text)) continue;
+
+      const current = {
+        speaker,
+        text,
+        updatedAt: Number(snapshot.seenAt || 0) || Date.now(),
+      };
+      const previous = compiled[compiled.length - 1];
+
+      if (!previous || speakerKey(previous.speaker) !== speakerKey(current.speaker)) {
+        compiled.push(current);
+        continue;
+      }
+
+      const gap = current.updatedAt - (previous.updatedAt || current.updatedAt);
+      const merged = gap >= 0 && gap <= ROLLING_WINDOW_MS ? mergeMeetCaptionText(previous.text, current.text) : "";
+      if (merged) {
+        previous.text = cleanCompiledText(merged);
+        previous.updatedAt = Math.max(previous.updatedAt || 0, current.updatedAt || 0);
+        continue;
+      }
+
+      if (gap >= 0 && gap <= MEET_CONTINUATION_GAP_MS) {
+        previous.text = cleanCompiledText(joinCaptionTexts(previous.text, current.text));
+        previous.updatedAt = Math.max(previous.updatedAt || 0, current.updatedAt || 0);
+        continue;
+      }
+
+      compiled.push(current);
+    }
+
+    return compiled
+      .map((entry) => ({ ...entry, text: cleanCompiledText(entry.text) }))
+      .filter((entry) => isSpeakerLine(entry.speaker, "caption text") && isTranscriptEntryText(entry.text));
+  }
+
+  function mergeMeetCaptionText(previous, next) {
+    const previousText = cleanTranscriptText(previous);
+    const nextText = cleanTranscriptText(next);
+    if (!previousText) return nextText;
+    if (!nextText) return previousText;
+
+    const previousCompare = normalizeForCompare(previousText);
+    const nextCompare = normalizeForCompare(nextText);
+    if (!previousCompare) return nextText;
+    if (!nextCompare) return previousText;
+    if (previousCompare === nextCompare) return previousText;
+    if (containsNormalizedPhrase(nextCompare, previousCompare)) return nextText;
+    if (containsNormalizedPhrase(previousCompare, nextCompare)) return previousText;
+
+    const overlap = commonSuffixPrefixOverlap(previousText, nextText);
+    if (overlap >= 2) return mergeByWordOverlap(previousText, nextText, overlap);
+
+    const previousWords = normalizedWords(previousText);
+    const nextWords = normalizedWords(nextText);
+    const prefix = commonPrefixLength(previousWords, nextWords);
+    if (prefix >= 4 && nextWords.length >= previousWords.length - 1) return nextText;
+    if (prefix >= 4 && previousWords.length > nextWords.length) return previousText;
+
+    return "";
+  }
+
+  function joinCaptionTexts(previous, next) {
+    return mergeMeetCaptionText(previous, next) || cleanTranscriptText(`${previous} ${next}`);
+  }
+
+  function cleanCompiledText(value) {
+    return stripTrailingKnownSpeakerNames(cleanTranscriptText(value));
+  }
+
+  function containsNormalizedPhrase(container, phrase) {
+    if (!container || !phrase) return false;
+    return container === phrase || container.startsWith(`${phrase} `) || container.endsWith(` ${phrase}`) || container.includes(` ${phrase} `);
+  }
+
+  function normalizedWords(value) {
+    return normalizeForCompare(value).split(/\s+/).filter(Boolean);
+  }
+
+  function captionWordParts(value) {
+    return cleanText(value)
+      .split(/\s+/)
+      .map((word) => ({ raw: word, key: normalizeForCompare(word) }))
+      .filter((part) => part.key);
+  }
+
+  function commonSuffixPrefixOverlap(previous, next) {
+    const left = captionWordParts(previous);
+    const right = captionWordParts(next);
+    const max = Math.min(left.length, right.length);
+
+    for (let size = max; size >= 2; size -= 1) {
+      let matches = true;
+      for (let index = 0; index < size; index += 1) {
+        if (left[left.length - size + index].key !== right[index].key) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) return size;
+    }
+
+    return 0;
+  }
+
+  function mergeByWordOverlap(previous, next, overlap) {
+    const left = captionWordParts(previous);
+    const right = captionWordParts(next);
+    return cleanTranscriptText([...left.map((part) => part.raw), ...right.slice(overlap).map((part) => part.raw)].join(" "));
+  }
+
   function mergeRollingDuplicates() {
     for (const entry of entries) {
       if (entry?.text) entry.text = cleanEntryText(entry);
@@ -1332,7 +1500,15 @@
 
   function transcriptText() {
     finalizeTranscript();
-    return entries.map((entry) => `${displaySpeaker(entry.speaker)}: ${entry.text}`).join("\n\n") + (entries.length ? "\n" : "");
+    const outputEntries = finalTranscriptEntries();
+    return outputEntries.map((entry) => `${displaySpeaker(entry.speaker)}: ${entry.text}`).join("\n\n") + (outputEntries.length ? "\n" : "");
+  }
+
+  function finalTranscriptEntries() {
+    if (!IS_MEET) return entries;
+
+    const compiled = compileMeetRawSnapshots(rawSnapshots);
+    return compiled.length ? compiled : entries;
   }
 
   function render() {

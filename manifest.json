@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Meeting Caption Capture",
-  "version": "0.30.0",
+  "version": "0.31.0",
   "description": "Capture visible Google Meet and Microsoft Teams captions into plain text without screen sharing.",
   "content_scripts": [
     {
