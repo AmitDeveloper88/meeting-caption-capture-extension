@@ -1,0 +1,22 @@
+# OS/editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Logs/temp
+*.log
+*.tmp
+tmp/
+temp/
+
+# Packaged extension builds
+*.zip
+*.crx
+dist/
+build/
+
+# Dependencies, if tooling is added later
+node_modules/
